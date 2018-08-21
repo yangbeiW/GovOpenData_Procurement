@@ -1,0 +1,552 @@
+---
+title: "Government of Canada 2009-2018 Rewarded Contracts Analysis"
+date: "April 23, 2018"
+author: "Yangbei Wang"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+#setwd("~/MEBT/Research Project/Project in R/Contracts") #home wd
+setwd("~/R/R projects/Contract") #work wd
+
+```
+
+
+Used library list
+```{r message=FALSE, warning=FALSE, libList, eval=FALSE}
+
+library(tidyverse)
+library(ggplot2)
+library(stringr)
+library(lubridate)
+library(fitdistrplus)
+library(rpart)
+library(rpart.plot)
+library(rattle)
+library(caret)
+library(e1071)
+library(partykit)
+library(randomForest)
+library(pROC)
+library(nnet)
+library(NeuralNetTools)
+library(devtools)
+library(clusterGeneration)
+```
+
+
+Read in source dataset in csv file format
+```{r readIn, cache=TRUE}
+
+#read in main contract dataset
+goc_contracts<- read_csv("tpsgc-pwgsc_co-ch_tous-all.csv")
+
+print(goc_contracts)
+
+# fix non-semantic text: change dash to underscore in field names
+x<- str_replace_all(names(goc_contracts),"-","_") 
+names(goc_contracts)<- x
+rm(x)
+
+# Exclude French Colunms (36 columns remain)
+goc_contracts<- goc_contracts %>% dplyr::select(-contains("_fr"))
+print(names(goc_contracts))
+
+#read in suppliment gsin dataset
+gsin <- read_csv("tpsgc-pwgsc_nibs-gsin.csv")
+
+# fix non-semantic text: change dash to underscore in field names
+x<- str_replace_all(names(gsin),"-","_") 
+names(gsin)<- x
+rm(x)
+
+#select and rename only gsin and opi column  
+gsin <- gsin %>% dplyr::select(nibs_gsin,bpr_opi) %>% rename(gsin = nibs_gsin, opi = bpr_opi)
+
+
+print(names(gsin))
+
+```
+
+
+```{r Basic Analysis_ explore total number and value by day,month and year}
+#Daily total value rewarded until 2017-12-31
+value_by_number <- goc_contracts %>% group_by(award_date) %>% summarise(number = n(), total = sum(contract_value))
+# exclude year 2018 
+value_by_number <- value_by_number %>% filter (award_date < "2018-01-01")
+
+print(value_by_number)
+
+
+#Monthly total value rewarded
+value_by_month <- goc_contracts %>% group_by(month = floor_date(award_date, "month")) %>% summarise(number = n(), total = sum(contract_value))
+# exclude year 2018 
+value_by_month <- value_by_month %>% filter(month < "2018-01-01")
+
+print(value_by_month)
+
+#Yearly total Value rewarded
+value_by_year <- goc_contracts %>% group_by(year = floor_date(award_date, "year")) %>% summarise(number = n(), total = sum(contract_value))
+# exclude year 2018 
+value_by_year <- value_by_year %>% filter(year !='2018-01-01') 
+
+print(value_by_year)
+```
+
+
+
+```{r prepare data frame by unique contract with original value}
+
+#Unique contract total value including all amendments
+goc_contracts_unique<- goc_contracts %>% group_by(contract_number) %>% summarise(amend_sum=sum(contract_value))
+
+
+X<- goc_contracts %>% dplyr::select(award_date:date_file_published)
+index_order<- length(goc_contracts$contract_number) - match(goc_contracts_unique$contract_number,rev(goc_contracts$contract_number)) +1 # finds last match
+
+X<- X[index_order,]
+goc_contracts_unique<- bind_cols(goc_contracts_unique,X)
+
+rm(X,index_order)
+
+#Unique contract with initial value
+
+a <- goc_contracts %>% group_by(contract_number) %>% summarise(amendments = n(), amendment_number = min(amendment_number), origin_contract_value = first(contract_value))
+
+#Add a target variable of ifamend
+a <- a %>% mutate(ifamend = ifelse(amendments == 1, 0, 1))
+
+a <- a %>% left_join(goc_contracts_unique, by = "contract_number")
+
+a <- a %>% mutate(factor(ifamend),origin_contract_value = origin_contract_value/1000) %>% filter(origin_contract_value >= 0)
+
+  
+a <- a %>%  rename(contract_value_in_thousand = origin_contract_value)
+
+#exclude duplicate and redundant columns (3)
+a <- a %>% dplyr::select(-supplier_legal_name, -supplier_operating_name, -date_file_published)
+
+goc_contracts_uniqueOrigin <- a
+rm(a)
+
+
+#rm(X, index_order)
+
+#clean the nagative value in data, amend_sum(1968), contract_value(8841) (loss 6.37%)
+#goc_contracts_uniqueOrigin <- goc_contracts_uniqueOrigin %>% filter( contract_value >0)
+
+
+print(goc_contracts_uniqueOrigin)
+```
+
+```{r engineering with gsin and add new opi ,gsin_cat, dept_user variables to unique df }
+
+a <- goc_contracts_uniqueOrigin %>% dplyr::select(contract_number,gsin)
+a <- a %>% left_join(gsin, by = "gsin")
+
+x <- factor(a$opi)
+opi_name <- levels(x)
+#position <- str_locate(opi_name,"\"")[1,]
+rename <- str_sub(opi_name,3,4)
+levels(x) <- rename
+a$opi <- as.character(x)
+a <- a %>%  dplyr::select(contract_number, opi)
+
+goc_contracts_uniqueOrigin <- goc_contracts_uniqueOrigin %>% left_join(a, by = "contract_number")
+rm(x,rename,opi_name)
+
+#gsin category: Service (A,B,C,D,E,F,G,H,J,K,L,M,R,S,T,U,V,X,Z) GOODS(10,11,..., CL,DI) CONSTRUCTION (51)
+b <- goc_contracts_uniqueOrigin %>% dplyr::select(contract_number,gsin)
+b <- b %>% mutate(gsin_cat = str_sub(gsin,1,2))
+
+x <- c("A","B","C","D","E","F","G","H","J","K","L","M","R","S","T","U","V","X","Z")
+y <- c(10:20,22:26,28:32,34:49,52:56,58:63,65:81,83:85,87:89,91,93:96,99,"CL","DI")
+
+
+b <- b %>% mutate(gsin_cat = ifelse(gsin_cat == "51", "Construction", gsin_cat))
+b <- b %>% mutate(gsin_cat = ifelse(str_sub(gsin,1,1) %in% x , "Service", gsin_cat))
+b <- b %>% mutate(gsin_cat = ifelse(!str_sub(gsin,1,1) %in% x & str_sub(gsin,2,3) %in% y & gsin_cat != "Construction", "Goods", gsin_cat))
+b <- b %>% mutate(gsin_cat = ifelse(gsin_cat == "N5", "Goods", gsin_cat))
+b <- b %>% mutate(gsin_cat = ifelse(gsin_cat == "WL" | gsin_cat == "WR", "Service",gsin_cat))
+
+b <- b %>%  dplyr::select(contract_number,gsin_cat)
+
+goc_contracts_uniqueOrigin <- goc_contracts_uniqueOrigin %>% left_join(b, by = "contract_number")
+rm(a,b,x,y)
+
+
+## Create abbreviation column for department users
+a <- goc_contracts_uniqueOrigin
+
+a$end_user_entity_en<- factor(a$end_user_entity_en)
+x<- abbreviate(levels(a$end_user_entity_en))
+a$end_user_entity_en<- as.character(a$end_user_entity_en)
+
+names(x)<- NULL
+y<- paste(sapply(1:length(x),function(ii){str_c(unlist(str_extract_all(x[ii], "[A-Z]")), collapse = "")}), collapse = " ")
+y<- str_split(y, " ")[[1]]
+
+a<- a %>% mutate(dpt_user = factor(end_user_entity_en))
+levels(a$dpt_user)<-y
+a$dpt_user<- as.character(a$dpt_user)
+
+goc_contracts_uniqueOrigin <- a
+rm(a,x,y)
+
+
+##Create new contract valid period variable
+a <- goc_contracts_uniqueOrigin
+
+a <- a %>% filter(expiry_date > award_date) %>% filter(expiry_date < ymd_hms("2030-01-01 00:00:00"))
+
+a <- a %>% mutate(valid_days = ceiling(as.numeric(as.duration(expiry_date - award_date))/3600/24))
+
+#Build time quartiles
+a<- a %>% 
+  mutate(time_class = as.numeric(cut(valid_days,quantile(valid_days), include.lowest = TRUE)))
+
+a <- a %>% mutate(time_class = ifelse(time_class == 1,"Less than 3mth",time_class ))
+a <- a %>% mutate(time_class = ifelse(time_class == 2,"3-10 months",time_class ))
+a <- a %>% mutate(time_class = ifelse(time_class == 3,"10-12 months",time_class ))
+a <- a %>% mutate(time_class = ifelse(time_class == 4,"More than 1 year",time_class ))
+
+goc_contracts_uniqueOrigin <- a
+rm(a)
+
+
+```
+
+
+#Check to see if sum of contract value by amendments add up to total contract value.
+
+```{r basicAnalysis_2}
+
+
+#Unique contract total value including all amendments
+ goc_contracts_unique<- goc_contracts %>% group_by(contract_number) %>% summarise(amendments=n(), amend_sum=sum(contract_value))
+
+
+ X<- goc_contracts %>% dplyr::select(award_date:date_file_published)
+ index_order<- length(goc_contracts$contract_number) - match(goc_contracts_unique$contract_number,rev(goc_contracts$contract_number)) +1 # finds last match-
+
+X<- X[index_order,]
+goc_contracts_unique<- bind_cols(goc_contracts_unique,X)
+
+# finding unmatched total contract value compare to sumarised contract value with ammendents
+bad_match_contracts<- goc_contracts_unique %>% filter(amend_sum != total_contract_value)
+
+qplot(bad_match_contracts$amend_sum, bad_match_contracts$total_contract_value) + geom_point(color="blue") + 
+  geom_abline() + ggtitle("Contracts with amendment sum that do not add to total contract value\n(14,366 out of 169,138)")+
+  ylab("Total contract value") + xlab("Amendment sum")
+
+good_match_contracts<- goc_contracts_unique %>% filter(amend_sum == total_contract_value)
+
+goc_contracts_matched<- goc_contracts %>% filter(contract_number%in%good_match_contracts$contract_number)
+
+goc_contracts_unmatched<- goc_contracts %>% filter(!contract_number%in%good_match_contracts$contract_number)
+
+```
+
+
+
+
+```{r some analysis for Canada}
+
+
+# goc_contracts_unique_canada<- goc_contracts_unique %>% filter(supplier_address_country=="Canada")
+# prov_names<-c("Alberta", "British Columbia", "Manitoba", "New Brunswick", "Newfoundland and Labrador", "Northwest Territories", "Nova Scotia", "Nunavut", "Ontario", "Prince Edward Island", "Quebec", "Saskatchewan", "Yukon")
+# 
+# goc_contracts_unique_canada<-goc_contracts_unique_canada %>% mutate(new_prov=ifelse(
+#   supplier_address_prov_state%in%prov_names, supplier_address_prov_state,"Other"))
+# 
+# goc_summary<- goc_contracts_unique_canada %>% group_by(new_prov) %>% summarise(total = sum(total_value)) %>% mutate(prov_percent = total/sum(total)*100)
+
+```
+
+
+
+```{r Exploration of Time Series Data}
+
+#monthly contract total value and number plot
+value_by_month <- value_by_month %>% mutate(log_total = log(total)) #log the value
+print(value_by_month)
+
+time_series_plot_monthValue <- ggplot(value_by_month, aes(month, log_total)) + geom_point() + geom_line()
+print(time_series_plot_monthValue)
+
+time_series_plot_monthNumber <- ggplot(value_by_month, aes(month, number)) + geom_point()+ geom_line()
+print(time_series_plot_monthNumber)
+
+
+```
+
+
+
+```{r Time Series Autoregressive Model}
+
+# time series
+ts_est<- ar(value_by_month$log_total)
+
+x<- ts_est$resid[3:length(ts_est$resid)]
+
+#spending returns
+spend_ret<- tibble(new_month = value_by_month$month[2:nrow(value_by_month)], ret = diff(value_by_month$log_total))
+
+print(spend_ret)
+
+ggplot(spend_ret, aes(new_month, ret)) + geom_point() + geom_line() + ylab("log-return")
+
+```
+
+
+
+```{r Aboriginal business modeling}
+
+SPAB_contract <- goc_contracts_unique %>% filter(trade_agreement_description_en == "Set-Aside Program for Aboriginal Business (SPAB)")
+
+spab_by_month <- SPAB_contract %>% group_by(month = floor_date(award_date, "month")) %>% summarise(total = sum(contract_value))
+
+#plot Aboriginal Business contracts by time
+qplot(spab_by_month$month, spab_by_month$total/10^6)+ geom_point() + geom_smooth() + ggtitle("Contract Awarded to Aboriginal Business_ SPAB")+ ylab("Total contract value in millions") + xlab("Year")
+
+
+
+```
+
+
+
+
+```{r data frame preparation for modeling, echo=TRUE}
+dt_df <- goc_contracts_uniqueOrigin %>% filter(trade_agreement !="O") 
+
+# convert categorical variables to factors
+dt_df <- dt_df %>% mutate(
+  competitive_tender_en = factor(competitive_tender_en),organization_employee_count_en = factor(organization_employee_count_en),trade_agreement = factor(trade_agreement), contracting_address_country = factor(contracting_address_country), solicitation_procedure = factor(solicitation_procedure),  opi = factor(opi), gsin_cat = factor(gsin_cat),time_class = factor(time_class),dpt_user = factor(dpt_user)
+) 
+
+# ramdenly split dataset to train (80%) and test sets (20%) by shuffling 
+n <- nrow(dt_df)
+shuffled_df <- dt_df[sample(n), ]
+train_indices <- 1:round(0.8 * n)
+train <- shuffled_df[train_indices, ]
+test_indices <- (round(0.8 * n) + 1):n
+test <- shuffled_df[test_indices, ]
+
+rm(n,shuffled_df,test_indices,train_indices)
+```
+
+
+
+```{r CART Decision Tree, echo=TRUE}
+# training the Tree in full
+fit_full <- rpart(ifamend ~ gsin_cat + competitive_tender_en + 
+               organization_employee_count_en + contract_value_in_thousand + trade_agreement + solicitation_procedure + opi +dpt_user+ time_class,
+             data = train,
+             method = "class",
+             control=rpart.control(minsplit=2, cp=0.005))
+
+printcp(fit_full)
+plotcp(fit_full)
+
+#Prun the tree with best cp
+pfit <- rpart(ifamend ~ opi +contract_value_in_thousand + trade_agreement + gsin_cat +  dpt_user + time_class+ organization_employee_count_en,
+             data = train,
+             method = "class",
+             control=rpart.control(minsplit=2, cp=0.005, use.n = TRUE))
+
+# ppfit<- prune(pfit, cp = pfit$cptable[which.min(pfit$cptable[,"xerror"]),"CP"])
+# 
+# fancyRpartPlot(ppfit, uniform=TRUE, main="Pruned Classification Tree")
+
+# Plot the tree and detail of split. 10-fold cross-validation with cp values.
+fancyRpartPlot(pfit, cex =0.7)
+
+printcp(pfit)
+plotcp(pfit)
+#summary(pfit, cp=0.001) 
+
+# Predict on train set
+prediction_train <- predict(pfit, train, type="prob", na.action = na.pass)
+Y <- data.frame(contract_number = train$contract_number, 
+                     prediction = prediction_train, amended = train$ifamend)
+
+Y<- Y %>% mutate(pifamend = ifelse(prediction.0>.5,0,1))
+
+confusionMatrix(train$ifamend,Y$pifamend)
+auc(train$ifamend,Y$pifamend)
+plot(roc(train$ifamend,Y$pifamend),print.auc = TRUE)
+
+
+# Predict on test set
+prediction_test <- predict(pfit, test, type="prob", na.action = na.pass)
+Z <- data.frame(contract_number = test$contract_number, 
+                     prediction = prediction_test, amended = as.character(test$ifamend))
+
+Z<- Z %>% mutate(pifamend = ifelse(prediction.0>.5,0,1))
+
+head(Z)
+confusionMatrix(test$ifamend,Z$pifamend)
+auc(test$ifamend,Z$pifamend)
+plot(roc(test$ifamend,Z$pifamend),print.auc = TRUE)
+
+rm(Y,Z)
+
+```
+
+```{r C50 Decision Tree, echo=TRUE}
+vars <- c("contract_value","trade_agreement","opi")
+
+C5model <- C5.0(x = train[,-3], y = train$ifamend,
+               control = C5.0Control(winnow = TRUE),
+               na.action = na.pass)
+               
+C5predict <- predict(C5model, test, type = "class")
+
+```
+
+
+
+```{r random forest, echo=TRUE}
+
+#rf_train <- train %>% dplyr::select(contract_number, contract_value_in_thousand, trade_agreement, ifamend, organization_employee_count_en, gsin_cat,competitive_tender_en, opi,dpt_user,time_class) 
+
+rf_train <- train %>% dplyr::select(ifamend,contract_number,competitive_tender_en, opi,contract_value_in_thousand, trade_agreement , gsin_cat ,  dpt_user , time_class, organization_employee_count_en)
+
+rf_train <- as_data_frame(rf_train)
+
+rffit <- randomForest(as.factor(ifamend) ~  gsin_cat+ contract_value_in_thousand+ trade_agreement+  organization_employee_count_en  +competitive_tender_en  + time_class,
+                      data = rf_train,
+                      na.action= na.pass,
+                      importance = TRUE,
+                      ntree = 200)
+varImpPlot(rffit)
+
+#Predicting
+Pred_train <- predict(rffit,train)
+Pred_test <- predict(rffit,test)
+
+#Save predicting result as a data frame
+rfresult_train <- data.frame(contract = train$contract_number, pifamend = Pred_train, ifamend = train$ifamend)
+rfresult_test <- data.frame(contract = test$contract_number, pifamend = Pred_test, ifamend = test$ifamend)
+
+#(train set)Predicting performance evaluation metrics (confusion matrix, ROC curve and AUC)
+confusionMatrix(rfresult_train$pifamend,rfresult_train$ifamend)
+rfresult_train$pifamend <- as.numeric(rfresult_train$pifamend)
+auc(train$ifamend,rfresult_train$pifamend)
+plot(roc(train$ifamend,rfresult_train$pifamend),print.auc = TRUE)
+
+#(Test set)Predicting performance evaluation metrics (confusion matrix, ROC curve and AUC)
+confusionMatrix(rfresult_test$pifamend,rfresult_test$ifamend)
+rfresult_test$pifamend <- as.numeric(rfresult_test$pifamend)
+auc(test$ifamend,rfresult_test$pifamend)
+plot(roc(test$ifamend,rfresult_test$pifamend),print.auc = TRUE)
+
+```
+
+
+
+```{r neural network, echo=TRUE}
+# Scale data for neural network
+
+# train_nn <- train %>% filter(!is.na(opi)) %>% dplyr::select(contract_value_in_thoursand, trade_agreement,   organization_employee_count_en, competitive_tender_en, ifamend)
+# 
+# test_nn <- test %>% filter(!is.na(opi)) %>% dplyr::select(contract_value_in_thousand, trade_agreement,  organization_employee_count_en,competitive_tender_en, ifamend)
+
+# 
+a <- goc_contracts_uniqueOrigin %>% dplyr::select(contract_number,contract_value_in_thousand, trade_agreement,solicitation_procedure, ifamend,contracting_address_country, organization_employee_count_en, gsin_cat,competitive_tender_en, opi,dpt_user,time_class)
+
+a <- a %>% mutate(
+  competitive_tender_en = factor(competitive_tender_en),organization_employee_count_en = factor(organization_employee_count_en),trade_agreement = factor(trade_agreement), contracting_address_country = factor(contracting_address_country), solicitation_procedure = factor(solicitation_procedure),  opi = factor(opi), gsin_cat = factor(gsin_cat),dpt_user = factor(dpt_user),time_class = factor(time_class)
+) 
+
+a <- a %>% mutate_if(is.factor,as.numeric) %>% filter(!is.na(opi))
+
+index <- sample(1:nrow(a),round(0.8*nrow(a)))
+train <- a[index,]
+test <- a[-index,]
+
+rm(a,index)
+
+
+#scale the data
+# maxs <- apply(a, 2, max)
+# mins <- apply(a, 2, min)
+# 
+# a <- a %>% dplyr::select(-contract_number,-opi,-dpt_user)
+# 
+# 
+# scaled <- as.data.frame(scale(a, center = mins, scale = maxs - mins))
+# 
+# train_nn <- scaled[index,]
+# test_nn <- scaled[-index,]
+
+
+
+# procValues <- preProcess(train,method =c("center","scale"))
+# scaledTrainData <- predict(procValues,train)
+# 
+# procValues <- preProcess(test,method =c("center","scale"))
+# scaledTestData <- predict(procValues,test)
+
+# n <- names(train_nn)
+# f <- as.formula(paste("ifamend ~ ", paste(n[!n %in% "ifamend"], collapse = " + ")))
+
+
+#m <- model.matrix( ~ ifamend + contract_value_in_thousand+ trade_agreement +  organization_employee_count_en+ competitive_tender_en+solicitation_procedure+ contracting_address_country+ competitive_tender_en +opi+gsin_cat, 
+ # data = train_nn)
+
+
+# nn <- neuralnet(f ,data=train_nn, hidden=c(5,3),linear.output=FALSE)
+# 
+# 
+# 
+# NN <- neuralnet(ifamend ~  contract_value_in_thousand +
+#                   trade_agreement+ opi + gsin_cat +
+#                   organization_employee_count_en + 
+#                   competitive_tender_en,
+#                 train_nn, 
+#                 hidden = 2, 
+#                 linear.output = FALSE )
+
+
+ann <- nnet(as.factor(ifamend) ~ contract_value_in_thousand + trade_agreement+ opi + gsin_cat +
+                  organization_employee_count_en + dpt_user + time_class +
+                  competitive_tender_en,
+            data = train,
+            size = 6,
+            maxit = 200,
+            linout = F
+            )
+
+print(ann$wts)
+summary(ann)
+
+
+#Predict using NN
+nnpredict_train <- predict(ann,train,type = "class")
+nnpredict_test <- predict(ann,test,type = "class")
+
+
+
+nnresult_train <- data.frame(contract = train$contract_number,pifamend = nnpredict_train, ifamend = train$ifamend)
+nnresult_test <- data.frame(contract = test$contract_number,pifamend = nnpredict_test, ifamend = test$ifamend)
+
+confusionMatrix(nnresult_train$pifamend,nnresult_train$ifamend)
+confusionMatrix(nnresult_test$pifamend,nnresult_test$ifamend)
+
+#ROC Curve, Area under Curve(AUC)
+nnresult_train$pifamend <- as.numeric(nnresult_train$pifamend)
+nnresult_test$pifamend <- as.numeric(nnresult_test$pifamend)
+
+auc(nnresult_train$ifamend,nnresult_train$pifamend)
+auc(nnresult_test$ifamend,nnresult_test$pifamend)
+
+plot(roc(nnresult_train$ifamend,nnresult_train$pifamend),print.auc = TRUE)
+plot(roc(nnresult_test$ifamend,nnresult_test$pifamend),print.auc = TRUE)
+
+plotnet(ann,y_name ="ifamend",cex_val = 0.7)
+neuralweights(ann)
+
+```
